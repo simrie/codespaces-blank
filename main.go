@@ -17,9 +17,10 @@ type response struct {
 }
 
 type Login struct {
-	UserName  string `json:"username"`
-	SessionID string `json:"session_id"`
-	HeaderID  string `json:"header_id"`
+	UserName  string    `json:"userName"`
+	SessionID string    `json:"session_id"`
+	HeaderID  string    `json:"header_id"`
+	Expires   time.Time `json:"expires"`
 }
 
 var UserSessions = make(map[string]Login)
@@ -103,12 +104,13 @@ func loginHandler(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	login := Login{UserName: userName, SessionID: sessionID, HeaderID: headerID}
+	expires := time.Now().Add(time.Hour)
+
+	login := Login{UserName: userName, SessionID: sessionID, HeaderID: headerID, Expires: expires}
 	userSessionsMu.Lock()
 	UserSessions[userName] = login
 	userSessionsMu.Unlock()
 
-	expires := time.Now().Add(time.Hour)
 	http.SetCookie(writer, &http.Cookie{
 		Name:     "sessionId",
 		Value:    sessionID,
@@ -127,6 +129,17 @@ func loginHandler(writer http.ResponseWriter, request *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
+	http.SetCookie(writer, &http.Cookie{
+		Name:     "userName",
+		Value:    userName,
+		Path:     "/",
+		Expires:  expires,
+		MaxAge:   int(time.Hour.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	log.Printf("%+v", UserSessions)
 
 	writeJSON(writer, http.StatusCreated, login)
 }
