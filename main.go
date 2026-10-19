@@ -1,14 +1,29 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
+	"time"
 )
 
 type response struct {
 	Message string `json:"message"`
 }
+
+type Login struct {
+	UserName  string `json:"username"`
+	SessionID string `json:"session_id"`
+	HeaderID  string `json:"header_id"`
+}
+
+var UserSessions = make(map[string]Login)
+var userSessionsMu sync.RWMutex
 
 func main() {
 	server := &http.Server{
@@ -25,7 +40,8 @@ func main() {
 func newHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthHandler)
-	mux.HandleFunc("GET /api/v1/message", messageHandler)
+	mux.Handle("GET /api/v1/message", requireSession(http.HandlerFunc(messageHandler)))
+	mux.HandleFunc("POST /api/v1/login", loginHandler)
 	return loggingMiddleware(mux)
 }
 
@@ -37,7 +53,93 @@ func messageHandler(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, response{Message: "hello from Go"})
 }
 
-func writeJSON(writer http.ResponseWriter, status int, value response) {
+func requireSession(nextHTTP http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		sessionCookie, err := request.Cookie("sessionId")
+		if err != nil || sessionCookie.Value == "" {
+			writeJSON(writer, http.StatusUnauthorized, response{Message: "sessionId is required or invalid"})
+			return
+		}
+
+		userSessionsMu.RLock()
+		valid := false
+		for _, login := range UserSessions {
+			if login.SessionID == sessionCookie.Value {
+				valid = true
+				break
+			}
+		}
+		userSessionsMu.RUnlock()
+
+		if !valid {
+			writeJSON(writer, http.StatusUnauthorized, response{Message: "sessionId is required or invalid"})
+			return
+		}
+
+		nextHTTP.ServeHTTP(writer, request)
+	})
+}
+
+func loginHandler(writer http.ResponseWriter, request *http.Request) {
+	if err := request.ParseForm(); err != nil {
+		writeJSON(writer, http.StatusBadRequest, response{Message: "invalid form data"})
+		return
+	}
+
+	userName := strings.TrimSpace(request.PostFormValue("username"))
+	if userName == "" {
+		writeJSON(writer, http.StatusBadRequest, response{Message: "username is required"})
+		return
+	}
+
+	sessionID, err := generateID()
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, response{Message: "could not create login"})
+		return
+	}
+	headerID, err := generateID()
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, response{Message: "could not create login"})
+		return
+	}
+
+	login := Login{UserName: userName, SessionID: sessionID, HeaderID: headerID}
+	userSessionsMu.Lock()
+	UserSessions[userName] = login
+	userSessionsMu.Unlock()
+
+	expires := time.Now().Add(time.Hour)
+	http.SetCookie(writer, &http.Cookie{
+		Name:     "sessionId",
+		Value:    sessionID,
+		Path:     "/",
+		Expires:  expires,
+		MaxAge:   int(time.Hour.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.SetCookie(writer, &http.Cookie{
+		Name:     "headerID",
+		Value:    headerID,
+		Path:     "/",
+		Expires:  expires,
+		MaxAge:   int(time.Hour.Seconds()),
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+
+	writeJSON(writer, http.StatusCreated, login)
+}
+
+func generateID() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("generate random ID: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(bytes), nil
+}
+
+func writeJSON(writer http.ResponseWriter, status int, value any) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)
 	if err := json.NewEncoder(writer).Encode(value); err != nil {
